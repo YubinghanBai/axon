@@ -1,5 +1,5 @@
 [package]
-name = "axon-ml"
+name = "axon"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -11,10 +11,6 @@ keywords = ["machine-learning", "inference", "onnx", "pipeline", "serving"]
 categories = ["science", "multimedia", "web-programming::http-server"]
 authors = ["YubinghanBai"]
 rust-version = "1.85"
-
-# Crate name on crates.io is `axon-ml`, but `use axon::Pipeline` in code.
-[lib]
-name = "axon"
 
 [[bin]]
 name = "axon"
