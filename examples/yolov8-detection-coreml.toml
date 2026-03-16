@@ -1,0 +1,27 @@
+# Axon Pipeline: YOLOv8 Object Detection (CoreML acceleration)
+#
+# Same as yolov8-detection.toml but with device = "coreml"
+# for Apple Silicon GPU/Neural Engine acceleration.
+
+[model]
+name = "yolov8n"
+file = "models/yolov8n.onnx"
+device = "coreml"
+
+[pre]
+steps = [
+  { op = "image.decode" },
+  { op = "image.resize", target = 640, mode = "letterbox" },
+  { op = "image.normalize", scale = 255.0 },
+  { op = "image.layout", to = "chw" },
+  { op = "tensor.unsqueeze", dim = 0, blob_output = true },
+]
+
+[post]
+steps = [
+  { op = "detection.split", boxes = "0:4", scores = "4:", transpose = true },
+  { op = "detection.xywh_to_xyxy" },
+  { op = "detection.confidence_filter", threshold = 0.25 },
+  { op = "detection.nms", iou = 0.45 },
+  { op = "detection.format", output = "json" },
+]

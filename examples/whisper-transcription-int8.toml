@@ -1,0 +1,15 @@
+# Axon Pipeline: Whisper Speech-to-Text (INT8 Quantized)
+#
+# INT8 quantized encoder: 3.3x smaller, faster CPU inference.
+
+[model]
+name = "whisper-tiny-encoder-int8"
+file = "models/whisper-tiny-encoder-xenova-int8.onnx"
+description = "Whisper tiny encoder INT8 quantized"
+
+[pre]
+steps = [
+  { op = "audio.decode", sample_rate = 16000, channels = 1 },
+  { op = "mel.spectrogram", n_fft = 400, hop_length = 160, n_mels = 80 },
+  { op = "tensor.reshape", shape = [1, 80, 3000] },
+]

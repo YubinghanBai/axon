@@ -1,0 +1,27 @@
+# Axon Pipeline: Sherpa-ONNX Text-to-Speech
+#
+# High-quality TTS using VITS/Kokoro/Matcha models via sherpa-onnx.
+#
+# Input:  JSON {"text": "Hello world"}
+# Output: PCM f32 audio blob (audio/pcm-f32)
+#
+# Prerequisites:
+#   cargo build -p axon --features "cli,sherpa"
+#
+# Models (download from https://github.com/k2-fsa/sherpa-onnx/releases):
+#   - VITS: vits-model.onnx + tokens.txt + espeak-ng-data/
+#
+# Usage:
+#   axon run examples/sherpa-tts.toml \
+#     --input '{"text": "The quick brown fox jumps over the lazy dog."}' \
+#     --output speech.pcm
+
+[model]
+name = "sherpa-tts-vits"
+file = "placeholder.onnx"
+description = "VITS TTS — text to speech synthesis"
+
+[post]
+steps = [
+  { op = "sherpa.tts", model = "models/vits-model.onnx", tokens = "models/tokens.txt", data_dir = "models/espeak-ng-data", speaker_id = 0, speed = 1.0, num_threads = 2 },
+]

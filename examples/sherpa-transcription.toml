@@ -1,0 +1,43 @@
+# Axon Pipeline: Sherpa-ONNX Speech-to-Text
+#
+# High-performance ASR using sherpa-onnx (k2-fsa).
+# Supports: Whisper, Paraformer, SenseVoice, Zipformer transducer.
+#
+# Input:  raw audio bytes (WAV/MP3/FLAC)
+# Output: JSON {"text": "...", "tokens": [...]}
+#
+# Prerequisites:
+#   cargo build -p axon --features "cli,audio,sherpa"
+#
+# Models (download from https://github.com/k2-fsa/sherpa-onnx/releases):
+#   - Whisper tiny: whisper-tiny-encoder.onnx + whisper-tiny-decoder.onnx
+#   - Zipformer:    encoder.onnx + decoder.onnx + joiner.onnx
+#   - Paraformer:   paraformer.onnx
+#
+# Usage:
+#   axon run examples/sherpa-transcription.toml --input recording.wav
+
+[model]
+name = "sherpa-zipformer-zh-en"
+file = "placeholder.onnx"
+description = "Sherpa-ONNX handles model loading internally"
+
+[pre]
+steps = [
+  # Decode raw audio → mono f32 PCM at 16kHz
+  { op = "audio.decode", sample_rate = 16000 },
+]
+
+[post]
+steps = [
+  # Offline ASR — change model_type and paths to match your model.
+  #
+  # Transducer (Zipformer):
+  { op = "sherpa.transcribe", model_type = "transducer", encoder = "models/encoder.onnx", decoder = "models/decoder.onnx", joiner = "models/joiner.onnx", tokens = "models/tokens.txt", num_threads = 4 },
+  #
+  # Whisper (uncomment to use):
+  # { op = "sherpa.transcribe", model_type = "whisper", encoder = "models/whisper-tiny-encoder.onnx", decoder = "models/whisper-tiny-decoder.onnx", tokens = "models/tokens.txt", language = "en", num_threads = 4 },
+  #
+  # Paraformer (uncomment to use):
+  # { op = "sherpa.transcribe", model_type = "paraformer", model = "models/paraformer.onnx", tokens = "models/tokens.txt", num_threads = 4 },
+]

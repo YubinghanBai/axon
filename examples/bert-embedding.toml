@@ -1,0 +1,30 @@
+# Axon Pipeline: BERT Sentence Embedding
+#
+# Input:  raw text string
+# Output: 384-dim normalized embedding vector (JSON array)
+#
+# Model: all-MiniLM-L6-v2 (ONNX export)
+# Download: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+#
+# Usage:
+#   axon run --manifest examples/bert-embedding.toml --input "Hello world"
+
+[model]
+name = "all-MiniLM-L6-v2"
+file = "models/all-MiniLM-L6-v2.onnx"
+description = "384-dim sentence embedding model"
+
+[pre]
+steps = [
+  # Tokenize input text → token IDs + attention mask
+  { op = "tokenizer.encode", tokenizer = "models/tokenizer.json", max_length = 128, padding = true },
+]
+
+[post]
+steps = [
+  # Extract [CLS] token or mean-pool across sequence dimension
+  { op = "tensor.mean_pool", dim = 1 },
+
+  # L2 normalize for cosine similarity
+  { op = "tensor.normalize" },
+]

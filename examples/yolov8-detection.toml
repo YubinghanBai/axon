@@ -1,0 +1,52 @@
+# Axon Pipeline: YOLOv8 Object Detection
+#
+# Input:  raw image bytes (JPEG/PNG/WebP)
+# Output: JSON array of detections [{class, confidence, bbox: [x1,y1,x2,y2]}, ...]
+#
+# Model: YOLOv8n (ONNX export, 640x640 input)
+# Download: https://github.com/ultralytics/ultralytics
+#
+# Usage:
+#   axon run --manifest examples/yolov8-detection.toml --input photo.jpg
+
+[model]
+name = "yolov8n"
+file = "models/yolov8n.onnx"
+description = "YOLOv8 nano object detection (80 COCO classes)"
+
+[pre]
+steps = [
+  # Decode raw bytes → RGB f32 tensor [H, W, 3]
+  { op = "image.decode" },
+
+  # Resize to model input size with letterboxing
+  { op = "image.resize", target = 640, mode = "letterbox" },
+
+  # Normalize to [0, 1] range
+  { op = "image.normalize", scale = 255.0 },
+
+  # Convert HWC → CHW (model expects [1, 3, 640, 640])
+  { op = "image.layout", to = "chw" },
+
+  # Add batch dimension [C,H,W] → [1,C,H,W] (blob_output keeps raw bytes for ONNX)
+  { op = "tensor.unsqueeze", dim = 0, blob_output = true },
+]
+
+[post]
+steps = [
+  # Split raw output tensor into boxes + scores
+  # YOLOv8 output: [1, 84, 8400] → transpose → [8400, 84]
+  { op = "detection.split", boxes = "0:4", scores = "4:", transpose = true },
+
+  # Convert center format → corner format
+  { op = "detection.xywh_to_xyxy" },
+
+  # Filter low-confidence detections
+  { op = "detection.confidence_filter", threshold = 0.25 },
+
+  # Non-maximum suppression
+  { op = "detection.nms", iou = 0.45 },
+
+  # Format output as JSON
+  { op = "detection.format", output = "json" },
+]

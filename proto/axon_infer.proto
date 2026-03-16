@@ -1,0 +1,74 @@
+// Axon Inference Protocol — KServe V2 inspired, Axon-native.
+//
+// Axon takes raw bytes + content_type (not typed tensors).
+// This proto bridges gRPC transport to Axon's pipeline model.
+//
+// Compatible with standard gRPC health checking and KServe
+// model metadata, but inference uses Axon's blob-oriented API.
+
+syntax = "proto3";
+package axon.v2;
+
+service AxonInference {
+  // Health checking (KServe V2 compatible).
+  rpc ServerLive    (ServerLiveRequest)    returns (ServerLiveResponse);
+  rpc ServerReady   (ServerReadyRequest)   returns (ServerReadyResponse);
+  rpc ModelReady    (ModelReadyRequest)    returns (ModelReadyResponse);
+
+  // Model metadata.
+  rpc ModelMetadata (ModelMetadataRequest) returns (ModelMetadataResponse);
+
+  // Inference — raw bytes in, JSON or bytes out.
+  rpc ModelInfer    (ModelInferRequest)    returns (ModelInferResponse);
+}
+
+// ── Health ──────────────────────────────────────────────────
+
+message ServerLiveRequest  {}
+message ServerLiveResponse { bool live = 1; }
+
+message ServerReadyRequest  {}
+message ServerReadyResponse { bool ready = 1; }
+
+message ModelReadyRequest  { string name = 1; }
+message ModelReadyResponse { bool ready = 1; }
+
+// ── Metadata ────────────────────────────────────────────────
+
+message ModelMetadataRequest { string name = 1; }
+
+message ModelMetadataResponse {
+  string name = 1;
+  string platform = 2;
+  repeated string kernels = 3;
+  repeated string pre_steps = 4;
+  repeated string post_steps = 5;
+}
+
+// ── Inference ───────────────────────────────────────────────
+
+message ModelInferRequest {
+  // Pipeline name (as registered in axon serve --pipeline name=path).
+  string model_name = 1;
+  // Optional request ID for tracing.
+  string id = 2;
+  // Raw input bytes (image, audio, text, JSON).
+  bytes raw_input = 3;
+  // MIME type of raw_input (e.g. "audio/wav", "image/jpeg").
+  string content_type = 4;
+}
+
+message ModelInferResponse {
+  string model_name = 1;
+  string id = 2;
+  // JSON output (when pipeline returns KernelOutput::Json).
+  string json_output = 3;
+  // Binary output (when pipeline returns KernelOutput::Blob).
+  bytes raw_output = 4;
+  // Content type of raw_output.
+  string output_content_type = 5;
+  // Shape of raw_output tensor (if applicable).
+  repeated int64 shape = 6;
+  // Latency in milliseconds.
+  double latency_ms = 7;
+}

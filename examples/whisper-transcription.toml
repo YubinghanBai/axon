@@ -1,0 +1,38 @@
+# Axon Pipeline: Whisper Speech-to-Text
+#
+# Input:  raw audio bytes (WAV/MP3/AAC)
+# Output: JSON transcription {"text": "...", "segments": [...]}
+#
+# Model: Whisper tiny (ONNX export, encoder + decoder)
+# Download: https://huggingface.co/openai/whisper-tiny
+#
+# Usage:
+#   axon run --manifest examples/whisper-transcription.toml --input recording.wav
+
+[model]
+name = "whisper-tiny-encoder"
+file = "models/whisper-tiny-encoder.onnx"
+description = "Whisper tiny encoder (mel spectrogram → hidden states)"
+
+[pre]
+steps = [
+  # Decode raw audio → mono f32 PCM at 16kHz
+  { op = "audio.decode", sample_rate = 16000, channels = 1 },
+
+  # Compute 80-bin log-mel spectrogram (Whisper's input format)
+  # Window: 25ms (400 samples), hop: 10ms (160 samples), 80 mel bins
+  { op = "mel.spectrogram", n_fft = 400, hop_length = 160, n_mels = 80 },
+
+  # Pad/truncate to 30 seconds (3000 frames) — Whisper's fixed context
+  { op = "tensor.reshape", shape = [1, 80, 3000] },
+]
+
+# Note: Whisper encoder outputs hidden states [1, 1500, 384], not token IDs.
+# Full transcription requires encoder + decoder models (two-stage pipeline).
+# For now, this pipeline outputs the encoder hidden states as a feature blob.
+# Future: add decoder model + tokenizer.decode for full speech-to-text.
+#
+# [post]
+# steps = [
+#   { op = "tokenizer.decode", tokenizer = "models/whisper-tokenizer.json" },
+# ]

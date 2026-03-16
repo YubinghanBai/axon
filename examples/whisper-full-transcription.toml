@@ -1,0 +1,39 @@
+# Axon Pipeline: Whisper Full Speech-to-Text
+#
+# Input:  raw audio bytes (WAV/MP3/AAC)
+# Output: JSON {"text": "transcribed text..."}
+#
+# Models: Whisper tiny (encoder + decoder from Xenova/whisper-tiny)
+# Encoder: whisper-tiny-encoder.onnx (33MB) — mel spectrogram → hidden states
+# Decoder: whisper-tiny-decoder.onnx (112MB) — autoregressive greedy decoding
+#
+# Usage:
+#   axon run examples/whisper-full-transcription.toml --input recording.wav
+
+[model]
+name = "whisper-tiny-encoder"
+file = "models/whisper-tiny-encoder-xenova.onnx"
+description = "Whisper tiny: encoder (mel → hidden states) + decoder (greedy generation)"
+
+[pre]
+steps = [
+  # Decode raw audio → mono f32 PCM at 16kHz
+  { op = "audio.decode", sample_rate = 16000, channels = 1 },
+
+  # Compute 80-bin log-mel spectrogram (Whisper's input format)
+  { op = "mel.spectrogram", n_fft = 400, hop_length = 160, n_mels = 80 },
+
+  # Pad/truncate to 30 seconds (3000 frames) — Whisper's fixed context
+  { op = "tensor.reshape", shape = [1, 80, 3000] },
+]
+
+[post]
+steps = [
+  # Autoregressive greedy decoding with the decoder model.
+  # Whisper tokens: <|startoftranscript|>=50258, <|en|>=50259,
+  # <|transcribe|>=50359, <|notimestamps|>=50363, <|endoftext|>=50257
+  { op = "generate.greedy", model = "models/whisper-tiny-decoder.onnx", max_tokens = 128, start_tokens = [50258, 50259, 50359, 50363], eos_token = 50257 },
+
+  # Decode token IDs to text
+  { op = "tokenizer.decode", tokenizer = "models/whisper-tokenizer.json", task = "decode", skip_special_tokens = true },
+]

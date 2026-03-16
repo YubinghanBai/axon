@@ -1,0 +1,37 @@
+# Axon Pipeline: VAD → ASR (Voice Activity Detection + Transcription)
+#
+# Two-stage speech pipeline:
+#   1. Silero VAD detects speech segments (filters silence)
+#   2. Sherpa ASR transcribes detected speech
+#
+# Input:  raw audio bytes (WAV/MP3/FLAC)
+# Output: JSON {"speech_segments": [...], "has_speech": true/false}
+#
+# Prerequisites:
+#   cargo build -p axon --features "cli,audio,sherpa"
+#
+# Models:
+#   - Silero VAD:   silero_vad.onnx (from sherpa-onnx releases)
+#   - ASR model:    encoder.onnx + decoder.onnx + joiner.onnx (Zipformer)
+#
+# Usage:
+#   axon run examples/sherpa-vad-asr.toml --input long_recording.wav
+#
+# Note: In Axon (linear pipeline), VAD outputs segment metadata as JSON.
+# For full VAD→ASR→LLM→TTS workflows, use Medulla's signal orchestration.
+
+[model]
+name = "sherpa-vad"
+file = "placeholder.onnx"
+description = "Silero VAD — detect speech regions in audio"
+
+[pre]
+steps = [
+  { op = "audio.decode", sample_rate = 16000 },
+]
+
+[post]
+steps = [
+  # Silero VAD: detect speech vs silence
+  { op = "sherpa.vad", model = "models/silero_vad.onnx", threshold = 0.5, min_silence = 0.5, min_speech = 0.25 },
+]

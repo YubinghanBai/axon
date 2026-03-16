@@ -1,0 +1,38 @@
+/target
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Secrets
+.env
+.env.*
+
+# Models & large binaries (use `axon download` instead)
+*.onnx
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Audio/image test files
+*.wav
+*.mp3
+*.flac
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Logs
+*.log
+
+# Fuzz corpus/artifacts
+fuzz/corpus/
+fuzz/artifacts/
+
+# OS
+Thumbs.db
