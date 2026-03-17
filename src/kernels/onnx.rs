@@ -38,6 +38,10 @@ use crate::kernel::{ComputeKernel, KernelInput, KernelOutput};
 /// Sessions are wrapped in Mutex because `Session::run` requires `&mut self`.
 pub struct OnnxKernel {
     sessions: RwLock<HashMap<PathBuf, Arc<Mutex<Session>>>>,
+    /// Cache: whether a model supports dynamic batch dimension.
+    /// `true` = tensor batching works, `false` = must use serial fallback.
+    /// Discovered lazily on first batch attempt per model.
+    batch_supported: RwLock<HashMap<PathBuf, bool>>,
 }
 
 /// Config parsed from the operations JSON.
@@ -56,6 +60,7 @@ impl OnnxKernel {
         ort::init().commit();
         Ok(Self {
             sessions: RwLock::new(HashMap::new()),
+            batch_supported: RwLock::new(HashMap::new()),
         })
     }
 
@@ -161,52 +166,396 @@ impl ComputeKernel for OnnxKernel {
             .run(input_values)
             .map_err(|e| format!("onnx: inference: {e}"))?;
 
-        // Blob output mode: emit first f32 output as raw bytes.
-        if config.blob_output {
-            for (i, name) in output_names.iter().enumerate() {
-                if let Ok(view) = outputs[i].try_extract_array::<f32>() {
-                    let shape: Vec<usize> = view.shape().to_vec();
-                    let data: Vec<u8> = view.iter()
-                        .flat_map(|f| f.to_le_bytes())
-                        .collect();
-                    debug!(output = %name, shape = ?shape, bytes = data.len(), "onnx: blob output");
-                    return Ok(KernelOutput::Blob {
-                        data,
-                        content_type: "tensor/f32".to_string(),
-                        shape: Some(shape),
-                    });
-                }
-            }
-            return Err("onnx: blob_output requested but no f32 outputs found".into());
+        extract_single_output(&output_names, &outputs, &config)
+    }
+
+    fn supports_batch(&self) -> bool {
+        true
+    }
+
+    /// True tensor-level batching: concatenate N inputs along dim 0,
+    /// run a single session.run(), split outputs back to N results.
+    ///
+    /// Requirements:
+    /// - Single-input model (multi-input falls back to serial)
+    /// - All inputs must be blob type with compatible shapes
+    /// - Model must accept dynamic batch dimension
+    ///
+    /// Batch compatibility is cached per model path: on first attempt,
+    /// if batching fails (model lacks dynamic batch dim), the model is
+    /// marked incompatible and future calls skip directly to serial.
+    fn execute_batch(
+        &self,
+        inputs: Vec<KernelInput>,
+        operations: Value,
+    ) -> Result<Vec<KernelOutput>, AxonError> {
+        let n = inputs.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n == 1 {
+            return Ok(vec![self.execute(inputs.into_iter().next().unwrap(), operations)?]);
         }
 
-        // Standard JSON output mode.
-        let mut result = serde_json::Map::new();
+        let config = parse_config(&operations)?;
+
+        // Check batch compatibility cache.
+        if let Some(&supported) = self.batch_supported.read().get(&config.model_path) {
+            if !supported {
+                debug!(
+                    model = %config.model_path.display(),
+                    "onnx: cached as batch-incompatible, using serial"
+                );
+                return inputs
+                    .into_iter()
+                    .map(|input| self.execute(input, operations.clone()))
+                    .collect();
+            }
+        }
+
+        let session_mutex = self.get_or_load(&config.model_path, &config.device)?;
+        let mut session = session_mutex.lock();
+
+        let input_names: Vec<String> = session
+            .inputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let output_names: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+
+        // Only attempt tensor batching for single-input models with all-blob inputs.
+        let all_blobs = inputs.iter().all(|inp| inp.has_blobs()) && input_names.len() == 1;
+        if !all_blobs {
+            debug!("onnx: batch fallback to serial (non-blob or multi-input)");
+            drop(session);
+            return inputs
+                .into_iter()
+                .map(|input| self.execute(input, operations.clone()))
+                .collect();
+        }
+
+        info!(
+            model = %config.model_path.display(),
+            batch_size = n,
+            "onnx: running batched inference"
+        );
+
+        // Build concatenated tensor along batch dim 0.
+        let batched_inputs = build_batched_inputs_from_blobs(&input_names, &inputs, n)?;
+
+        // Single inference call. Process outputs while session is held,
+        // then release session before any serial fallback.
+        let batch_result: Result<Vec<KernelOutput>, String> = {
+            match session.run(batched_inputs) {
+                Ok(outputs) => {
+                    let r = split_batch_outputs(&output_names, &outputs, n, &config)
+                        .map_err(|e| e.to_string());
+                    // outputs dropped here (before session).
+                    r
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        // Session lock released here.
+        drop(session);
+
+        match batch_result {
+            Ok(outputs) => {
+                self.batch_supported
+                    .write()
+                    .insert(config.model_path.clone(), true);
+                Ok(outputs)
+            }
+            Err(e) => {
+                info!(
+                    model = %config.model_path.display(),
+                    error = %e,
+                    "onnx: batch inference failed, caching as incompatible"
+                );
+                self.batch_supported
+                    .write()
+                    .insert(config.model_path.clone(), false);
+                // Fall back to serial execution.
+                inputs
+                    .into_iter()
+                    .map(|input| self.execute(input, operations.clone()))
+                    .collect()
+            }
+        }
+    }
+}
+
+// ── Output extraction helpers ─────────────────────────────────
+
+/// Extract output from a single (non-batched) inference run.
+fn extract_single_output(
+    output_names: &[String],
+    outputs: &ort::session::SessionOutputs<'_>,
+    config: &OnnxConfig,
+) -> Result<KernelOutput, AxonError> {
+    // Blob output mode: emit first f32 output as raw bytes.
+    if config.blob_output {
         for (i, name) in output_names.iter().enumerate() {
-            // Try f32 first (most common), then i64.
             if let Ok(view) = outputs[i].try_extract_array::<f32>() {
                 let shape: Vec<usize> = view.shape().to_vec();
-                let data: Vec<f32> = view.iter().copied().collect();
-                result.insert(
-                    name.clone(),
-                    serde_json::json!({"shape": shape, "data": data}),
-                );
-            } else if let Ok(view) = outputs[i].try_extract_array::<i64>() {
-                let shape: Vec<usize> = view.shape().to_vec();
-                let data: Vec<i64> = view.iter().copied().collect();
-                result.insert(
-                    name.clone(),
-                    serde_json::json!({"shape": shape, "data": data}),
-                );
-            } else {
-                return Err(format!(
-                    "onnx: unsupported output dtype for '{name}' (only f32/i64 supported)"
-                ).into());
+                let data: Vec<u8> = view
+                    .iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect();
+                debug!(output = %name, shape = ?shape, bytes = data.len(), "onnx: blob output");
+                return Ok(KernelOutput::Blob {
+                    data,
+                    content_type: "tensor/f32".to_string(),
+                    shape: Some(shape),
+                });
             }
         }
-
-        Ok(KernelOutput::Json(serde_json::json!({"outputs": result})))
+        return Err("onnx: blob_output requested but no f32 outputs found".into());
     }
+
+    // Standard JSON output mode.
+    let mut result = serde_json::Map::new();
+    for (i, name) in output_names.iter().enumerate() {
+        if let Ok(view) = outputs[i].try_extract_array::<f32>() {
+            let shape: Vec<usize> = view.shape().to_vec();
+            let data: Vec<f32> = view.iter().copied().collect();
+            result.insert(
+                name.clone(),
+                serde_json::json!({"shape": shape, "data": data}),
+            );
+        } else if let Ok(view) = outputs[i].try_extract_array::<i64>() {
+            let shape: Vec<usize> = view.shape().to_vec();
+            let data: Vec<i64> = view.iter().copied().collect();
+            result.insert(
+                name.clone(),
+                serde_json::json!({"shape": shape, "data": data}),
+            );
+        } else {
+            return Err(format!(
+                "onnx: unsupported output dtype for '{name}' (only f32/i64 supported)"
+            )
+            .into());
+        }
+    }
+
+    Ok(KernelOutput::Json(serde_json::json!({"outputs": result})))
+}
+
+// ── Batch tensor helpers ──────────────────────────────────────
+
+/// Concatenate N blob inputs into a single batched tensor along dim 0.
+///
+/// Each blob must have shape `[1, D1, D2, ...]` with matching inner dims.
+/// Result: single tensor with shape `[N, D1, D2, ...]`.
+fn build_batched_inputs_from_blobs<'v>(
+    input_names: &[String],
+    inputs: &[KernelInput],
+    batch_size: usize,
+) -> Result<Vec<(String, SessionInputValue<'v>)>, String> {
+    let name = &input_names[0];
+    let mut all_bytes: Vec<&[u8]> = Vec::with_capacity(batch_size);
+    let mut inner_shape: Option<Vec<usize>> = None;
+    let mut content_type: Option<&str> = None;
+
+    for (i, input) in inputs.iter().enumerate() {
+        let blob = input
+            .first_blob()
+            .ok_or_else(|| format!("onnx: batch item {i} has no blob"))?;
+        let shape = blob
+            .meta
+            .shape
+            .as_ref()
+            .ok_or_else(|| format!("onnx: batch item {i} missing shape metadata"))?;
+
+        // Inner shape = shape[1..] (strip the batch dimension).
+        let item_inner: Vec<usize> = if shape.len() > 1 {
+            shape[1..].to_vec()
+        } else {
+            vec![]
+        };
+
+        if let Some(ref expected) = inner_shape {
+            if &item_inner != expected {
+                return Err(format!(
+                    "onnx: batch shape mismatch at item {i}: expected inner {:?}, got {:?}",
+                    expected, item_inner
+                ));
+            }
+        } else {
+            inner_shape = Some(item_inner);
+        }
+
+        if let Some(expected_ct) = content_type {
+            if blob.meta.content_type != expected_ct {
+                return Err(format!(
+                    "onnx: batch dtype mismatch at item {i}: expected {expected_ct}, got {}",
+                    blob.meta.content_type
+                ));
+            }
+        } else {
+            content_type = Some(&blob.meta.content_type);
+        }
+
+        all_bytes.push(&blob.bytes);
+    }
+
+    let inner_shape = inner_shape.unwrap_or_default();
+    let ct = content_type.unwrap_or("tensor/f32");
+
+    // Batched shape: [N, D1, D2, ...]
+    let mut batched_shape = vec![batch_size];
+    batched_shape.extend_from_slice(&inner_shape);
+
+    // Concatenate raw bytes (works because all tensors share the same inner shape).
+    let total_bytes: usize = all_bytes.iter().map(|b| b.len()).sum();
+    let mut cat_bytes = Vec::with_capacity(total_bytes);
+    for bytes in &all_bytes {
+        cat_bytes.extend_from_slice(bytes);
+    }
+
+    match ct {
+        "tensor/f32" => {
+            if cat_bytes.len() % 4 != 0 {
+                return Err("onnx: batch f32 blob size not aligned to 4 bytes".into());
+            }
+            let data: Vec<f32> = cat_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            validate_shape(&batched_shape, data.len())?;
+            let array = ArrayD::<f32>::from_shape_vec(IxDyn(&batched_shape), data)
+                .map_err(|e| format!("onnx: batch array: {e}"))?;
+            let tensor = Tensor::<f32>::from_array(array)
+                .map_err(|e| format!("onnx: batch tensor: {e}"))?;
+            debug!(name, batch_size, shape = ?batched_shape, "onnx: built batched f32 tensor");
+            Ok(vec![(name.clone(), tensor.into())])
+        }
+        "tensor/i64" => {
+            if cat_bytes.len() % 8 != 0 {
+                return Err("onnx: batch i64 blob size not aligned to 8 bytes".into());
+            }
+            let data: Vec<i64> = cat_bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            validate_shape(&batched_shape, data.len())?;
+            let array = ArrayD::<i64>::from_shape_vec(IxDyn(&batched_shape), data)
+                .map_err(|e| format!("onnx: batch array: {e}"))?;
+            let tensor = Tensor::<i64>::from_array(array)
+                .map_err(|e| format!("onnx: batch tensor: {e}"))?;
+            debug!(name, batch_size, shape = ?batched_shape, "onnx: built batched i64 tensor");
+            Ok(vec![(name.clone(), tensor.into())])
+        }
+        other => Err(format!(
+            "onnx: unsupported batch blob content_type '{other}'"
+        )),
+    }
+}
+
+/// Split a batched output tensor back into N individual results.
+///
+/// For blob_output mode: splits first f32 output into N blobs with shape `[1, ...]`.
+/// For JSON mode: splits all outputs into N JSON objects.
+fn split_batch_outputs(
+    output_names: &[String],
+    outputs: &ort::session::SessionOutputs<'_>,
+    batch_size: usize,
+    config: &OnnxConfig,
+) -> Result<Vec<KernelOutput>, AxonError> {
+    if config.blob_output {
+        // Blob output: split first f32 output into N blobs.
+        for (i, name) in output_names.iter().enumerate() {
+            if let Ok(view) = outputs[i].try_extract_array::<f32>() {
+                let shape = view.shape().to_vec();
+                if shape.is_empty() || shape[0] != batch_size {
+                    return Err(format!(
+                        "onnx: output batch dim mismatch: expected {batch_size}, got {:?}",
+                        shape.first()
+                    )
+                    .into());
+                }
+
+                let inner_shape: Vec<usize> = shape[1..].to_vec();
+                let item_elements: usize = inner_shape.iter().product::<usize>().max(1);
+                let flat: Vec<f32> = view.iter().copied().collect();
+
+                let mut results = Vec::with_capacity(batch_size);
+                for b in 0..batch_size {
+                    let start = b * item_elements;
+                    let end = start + item_elements;
+                    let item_data: Vec<u8> = flat[start..end]
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect();
+                    let mut item_shape = vec![1usize];
+                    item_shape.extend_from_slice(&inner_shape);
+                    results.push(KernelOutput::Blob {
+                        data: item_data,
+                        content_type: "tensor/f32".to_string(),
+                        shape: Some(item_shape),
+                    });
+                }
+                debug!(output = %name, batch_size, "onnx: split batch blob output");
+                return Ok(results);
+            }
+        }
+        return Err("onnx: blob_output requested but no f32 outputs in batch".into());
+    }
+
+    // JSON output: split each output tensor along batch dim.
+    let mut all_results: Vec<serde_json::Map<String, serde_json::Value>> =
+        (0..batch_size).map(|_| serde_json::Map::new()).collect();
+
+    for (i, name) in output_names.iter().enumerate() {
+        if let Ok(view) = outputs[i].try_extract_array::<f32>() {
+            let shape = view.shape().to_vec();
+            let inner_shape: Vec<usize> = shape[1..].to_vec();
+            let item_elements: usize = inner_shape.iter().product::<usize>().max(1);
+            let flat: Vec<f32> = view.iter().copied().collect();
+
+            for b in 0..batch_size {
+                let start = b * item_elements;
+                let end = start + item_elements;
+                let item_data: Vec<f32> = flat[start..end].to_vec();
+                let mut item_shape = vec![1usize];
+                item_shape.extend_from_slice(&inner_shape);
+                all_results[b].insert(
+                    name.clone(),
+                    serde_json::json!({"shape": item_shape, "data": item_data}),
+                );
+            }
+        } else if let Ok(view) = outputs[i].try_extract_array::<i64>() {
+            let shape = view.shape().to_vec();
+            let inner_shape: Vec<usize> = shape[1..].to_vec();
+            let item_elements: usize = inner_shape.iter().product::<usize>().max(1);
+            let flat: Vec<i64> = view.iter().copied().collect();
+
+            for b in 0..batch_size {
+                let start = b * item_elements;
+                let end = start + item_elements;
+                let item_data: Vec<i64> = flat[start..end].to_vec();
+                let mut item_shape = vec![1usize];
+                item_shape.extend_from_slice(&inner_shape);
+                all_results[b].insert(
+                    name.clone(),
+                    serde_json::json!({"shape": item_shape, "data": item_data}),
+                );
+            }
+        } else {
+            return Err(
+                format!("onnx: unsupported batch output dtype for '{name}'").into(),
+            );
+        }
+    }
+
+    Ok(all_results
+        .into_iter()
+        .map(|r| KernelOutput::Json(serde_json::json!({"outputs": r})))
+        .collect())
 }
 
 // ── Input building ─────────────────────────────────────────────

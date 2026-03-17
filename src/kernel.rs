@@ -166,6 +166,30 @@ pub trait ComputeKernel: Send + Sync {
         input: KernelInput,
         operations: serde_json::Value,
     ) -> Result<KernelOutput, AxonError>;
+
+    /// Whether this kernel supports true tensor-level batching.
+    ///
+    /// When true, `execute_batch` concatenates inputs along batch dim 0
+    /// for a single execution call (e.g. one ONNX session.run for N inputs).
+    /// When false, `execute_batch` falls back to serial per-item execution.
+    fn supports_batch(&self) -> bool {
+        false
+    }
+
+    /// Execute a batch of inputs in a single call.
+    ///
+    /// Default: serial execution. Kernels that support tensor batching
+    /// (like ONNX) override this to concatenate along dim 0.
+    fn execute_batch(
+        &self,
+        inputs: Vec<KernelInput>,
+        operations: serde_json::Value,
+    ) -> Result<Vec<KernelOutput>, AxonError> {
+        inputs
+            .into_iter()
+            .map(|input| self.execute(input, operations.clone()))
+            .collect()
+    }
 }
 
 // ── KernelRegistry ─────────────────────────────────────────────

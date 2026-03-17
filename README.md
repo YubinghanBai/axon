@@ -20,6 +20,11 @@ post-processing — and serve it via REST, gRPC, or CLI. One `cargo install`, on
 - **WASM sandbox** — run untrusted pre/post-processing with fuel + memory limits
 - **Vector DB sinks** — zero-ETL push to Qdrant, Weaviate, ChromaDB, Postgres
 - **GPU acceleration** — CoreML, CUDA, TensorRT, DirectML execution providers
+- **Semantic inference cache** — blake3 content-addressed, skip model on cache hit
+- **Cascade inference** — confidence-gated early exit with fallback model
+- **Circuit breaker** — automatic device fallback on consecutive failures
+- **Stateful sessions** — cross-request context for streaming (video tracking, etc.)
+- **Hot-reload** — zero-downtime model updates via `POST /admin/reload/{name}`
 - **Content-addressed blob store** — BLAKE3-hashed, LRU-cached, optional disk tier
 - **Model pool** — LRU warm-cached pipelines with preload + on-demand loading
 - **Typed error codes** — `[AX001]`–`[AX009]` for programmatic error handling
@@ -45,6 +50,11 @@ post-processing — and serve it via REST, gRPC, or CLI. One `cargo install`, on
 | OpenTelemetry | OTLP span export | Custom | None | None | None |
 | Model versioning | `name@version` | Built-in | None | Tags | None |
 | Model pool / cache | LRU with preload | Per-model | KV cache | GGUF cache | None |
+| Inference cache | blake3 content-addressed | None | Prefix cache | None | None |
+| Cascade inference | Confidence-gated fallback | Ensemble | None | None | None |
+| Circuit breaker | Auto device fallback | None | None | None | None |
+| Hot-reload | Zero-downtime swap | Model reload | None | None | None |
+| Stateful sessions | Cross-request context | Stateful backends | None | None | None |
 | GPU acceleration | CoreML/CUDA/TensorRT/DirectML | CUDA/TensorRT | CUDA | Metal/CUDA | CPU only |
 | Speech (ASR/VAD/TTS) | Sherpa-ONNX native | Plugin | None | Whisper only | None |
 | Vector DB sink | Qdrant/Weaviate/Chroma/PG | None | None | None | None |
@@ -156,8 +166,11 @@ axon serve \
 | `GET` | `/{name}/info` | Pipeline metadata (model, steps, kernels) |
 | `GET` | `/{name}/versions` | List available versions for a pipeline |
 | `GET` | `/pipelines` | List all loaded pipelines with metadata |
-| `GET` | `/metrics` | Prometheus text exposition format |
-| `GET` | `/health` | Health check, uptime, pipeline list, batching status |
+| `GET` | `/metrics` | Prometheus text exposition (includes batch metrics) |
+| `GET` | `/health` | Health check, uptime, pipeline list, batching & ready status |
+| `GET` | `/health/live` | Kubernetes liveness probe (always 200 if process alive) |
+| `GET` | `/health/ready` | Kubernetes readiness probe (503 during warmup/shutdown) |
+| `POST` | `/admin/reload/{name}` | Hot-reload pipeline (re-parse manifest, warmup, zero-downtime swap) |
 
 ```bash
 # Inference examples
@@ -225,10 +238,56 @@ Request 3 ─┤  (max_size=8,    ├─ Response 3
 Request 4 ─┘  timeout=50ms)  └─ Response 4
 ```
 
-- Requests queue via `mpsc` channel until `max_batch_size` or `timeout` reached
-- Each request gets its own `oneshot` reply channel
-- Prevents ORT session contention under concurrent load
+**Core features:**
+- **True tensor-level batching**: N pre-processed tensors concatenated along dim 0 → single `session.run()` → split back to N results. Maximizes GPU/NPU utilization.
+- **Adaptive batch sizing (AIMD)**: Additive Increase / Multiplicative Decrease controller auto-tunes batch size based on queue fill rate. High load → larger batches; low load → smaller batches. Bounded by `[min_batch_size, max_batch_size]`.
+- **Partial failure isolation**: Pre/post-processing failures are isolated per-item — a single bad input doesn't abort the entire batch. Other items still get results.
+- **Batch compatibility caching**: First batch attempt per model is try-and-cache. If the ONNX model lacks a dynamic batch dimension, it's marked incompatible and future calls skip directly to serial — zero repeated failures.
+- **Backpressure**: Optional bounded queue (`queue_capacity`). When full, new requests immediately get HTTP 503 (Service Unavailable) instead of unbounded memory growth.
+- Automatic serial fallback when tensor batching isn't possible (non-blob inputs, multi-input models, incompatible shapes)
 - Responses include `"batched": true` header for transparency
+
+### Cloud-Native Lifecycle
+
+Production-ready Kubernetes deployment support:
+
+- **Deep warmup**: On startup, each pipeline's ONNX session is loaded and dummy inference runs trigger JIT kernel compilation / workspace allocation. HTTP port is only exposed after warmup completes.
+- **K8s probes**: `/health/live` (liveness — 200 if process alive) and `/health/ready` (readiness — 503 during warmup/shutdown, 200 when ready). Configure in your K8s deployment YAML:
+  ```yaml
+  livenessProbe:
+    httpGet: { path: /health/live, port: 8080 }
+  readinessProbe:
+    httpGet: { path: /health/ready, port: 8080 }
+  ```
+- **Graceful shutdown**: SIGTERM/SIGINT → stop accepting new requests → drain in-flight batch queue → respond to all pending clients → exit. Zero request loss during rolling updates.
+
+### Inference Optimization
+
+- **Semantic cache**: After pre-processing, blake3-hash the preprocessed input → moka LRU cache → skip model inference on hit. Configured via `[cache]` in manifest.
+- **Cascade inference**: Run a fast primary model first, check max confidence against threshold. Below threshold → run heavy fallback model. Configured via `[cascade]` in manifest.
+- **Circuit breaker**: N consecutive inference failures → automatic device fallback (e.g., GPU → CPU). Lock-free state machine with recovery timeout and probe. Configured via `[resilience]` in manifest.
+
+### Stateful Sessions
+
+Cross-request state for streaming workloads (video tracking, speaker diarization, anomaly detection). Pass `X-Session-Id` header — the pipeline's `SessionStore` injects `_context` before post-processing and extracts it after.
+
+```bash
+# Frame 1: empty context, post-processing creates tracks
+curl -X POST http://localhost:8080/yolo -F "input=@frame1.jpg" -H "X-Session-Id: cam-1"
+
+# Frame 2: context from frame 1 injected, tracks updated
+curl -X POST http://localhost:8080/yolo -F "input=@frame2.jpg" -H "X-Session-Id: cam-1"
+```
+
+### Pipeline Hot-Reload
+
+Zero-downtime model updates via admin API. Parses manifest, validates kernels, warms up the new ONNX session, then atomically swaps the pipeline.
+
+```bash
+# Update model weights, then reload without restarting the server
+curl -X POST http://localhost:8080/admin/reload/yolo
+# {"status":"ok","pipeline":"yolo","model":"yolov8n"}
+```
 
 ---
 
@@ -245,6 +304,10 @@ Lock-free atomic counters, zero extra dependencies.
 | `axon_requests_errors` | counter | Failed inferences |
 | `axon_latency_avg_ms` | gauge | Average inference latency (ms) |
 | `axon_uptime_seconds` | gauge | Server uptime |
+| `axon_batch_count` | counter | Total batches processed |
+| `axon_batch_items_total` | counter | Total items across all batches |
+| `axon_batch_size_avg` | gauge | Average items per batch (key capacity indicator) |
+| `axon_queue_wait_avg_ms` | gauge | Average time requests spend waiting in batch queue |
 
 ### OpenTelemetry Tracing (`--otel` flag)
 
@@ -448,6 +511,22 @@ steps = [
   { op = "detection.nms", iou = 0.45 },
   { op = "detection.format", output = "json", labels = ["person", "car", "dog"] },
 ]
+
+# ── Optional: production features ─────────────────────────────
+
+[cache]                                  # Semantic inference cache
+ttl_seconds = 3600                       # Cache expiry (default: 1 hour)
+max_entries = 10000                      # Max cached results (default: 10k)
+
+[cascade]                                # Confidence-gated cascade inference
+confidence_threshold = 0.85              # Min confidence to accept primary model
+fallback = "models/yolov8x.onnx"        # Heavy fallback model
+fallback_device = "cpu"                  # Optional: device for fallback model
+
+[resilience]                             # Circuit breaker / device fallback
+fallback_device = "cpu"                  # Fallback on consecutive failures
+failure_threshold = 3                    # Failures before opening circuit
+recovery_timeout_seconds = 60            # Seconds before probing primary device
 ```
 
 ---

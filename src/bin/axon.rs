@@ -1013,6 +1013,9 @@ fn make_batch_config(batch_size: Option<usize>, batch_timeout_ms: u64) -> Option
         axon::batch::BatchConfig {
             max_batch_size: size,
             timeout: std::time::Duration::from_millis(batch_timeout_ms),
+            adaptive: false,
+            min_batch_size: 1,
+            queue_capacity: 0,
         }
     })
 }

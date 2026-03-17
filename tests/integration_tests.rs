@@ -749,6 +749,259 @@ fn test_large_tensor_pipeline() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// Batch pipeline integration tests
+// ══════════════════════════════════════════════════════════════════
+//
+// Tests true tensor-level batching: N inputs → pre each → concat dim 0
+// → single model call → split → post each → N outputs.
+
+/// Mock ONNX kernel that implements true tensor batching.
+///
+/// Single execute: returns a 384-dim blob tensor per input.
+/// Batch execute: verifies all inputs received, returns N individual results.
+struct BatchAwareOnnxKernel;
+
+impl ComputeKernel for BatchAwareOnnxKernel {
+    fn name(&self) -> &str {
+        "onnx"
+    }
+
+    fn execute(
+        &self,
+        _input: KernelInput,
+        _operations: serde_json::Value,
+    ) -> Result<KernelOutput, AxonError> {
+        let embedding: Vec<f32> = (0..384).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        Ok(KernelOutput::Blob {
+            data: embedding.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            content_type: "tensor/f32".to_string(),
+            shape: Some(vec![1, 384]),
+        })
+    }
+
+    fn supports_batch(&self) -> bool {
+        true
+    }
+
+    fn execute_batch(
+        &self,
+        inputs: Vec<KernelInput>,
+        _operations: serde_json::Value,
+    ) -> Result<Vec<KernelOutput>, AxonError> {
+        let n = inputs.len();
+        // Return N individual blob outputs, each marked with the batch index.
+        let mut results = Vec::with_capacity(n);
+        for i in 0..n {
+            // Each item gets a distinct embedding (first element = batch index).
+            let mut embedding: Vec<f32> = (0..384).map(|j| (j as f32 + 1.0) * 0.01).collect();
+            embedding[0] = i as f32; // Tag with batch index for verification.
+            results.push(KernelOutput::Blob {
+                data: embedding.iter().flat_map(|f| f.to_le_bytes()).collect(),
+                content_type: "tensor/f32".to_string(),
+                shape: Some(vec![1, 384]),
+            });
+        }
+        Ok(results)
+    }
+}
+
+fn make_batch_pipeline(toml: &str) -> Pipeline {
+    let manifest = Manifest::from_toml(toml).unwrap();
+    let mut registry = KernelRegistry::new();
+    registry.register(Arc::new(BatchAwareOnnxKernel));
+
+    #[cfg(feature = "onnx")]
+    registry.register(Arc::new(axon::kernels::tensor::TensorKernel));
+
+    Pipeline::new(manifest, registry, PathBuf::from("."))
+}
+
+// ── Test: run_batch with model-only pipeline ─────────────────────
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_run_batch_model_only() {
+    let toml = r#"
+[model]
+name = "batch-test"
+file = "model.onnx"
+"#;
+    let pipeline = make_batch_pipeline(toml);
+
+    let inputs: Vec<(&[u8], &str)> = vec![
+        (b"input-0", "text/plain"),
+        (b"input-1", "text/plain"),
+        (b"input-2", "text/plain"),
+        (b"input-3", "text/plain"),
+    ];
+
+    let results = pipeline.run_batch(&inputs).unwrap();
+    assert_eq!(results.len(), 4);
+
+    // Each output should be a blob from BatchAwareOnnxKernel.
+    for (i, result) in results.iter().enumerate() {
+        let output = result.as_ref().unwrap_or_else(|e| panic!("batch item {i} failed: {e}"));
+        match output {
+            KernelOutput::Blob { data, shape, .. } => {
+                assert_eq!(shape, &Some(vec![1, 384]));
+                // Verify the first float is the batch index (tagged in execute_batch).
+                let first_f32 = f32::from_le_bytes(data[..4].try_into().unwrap());
+                assert_eq!(
+                    first_f32, i as f32,
+                    "batch item {i} should have index tag"
+                );
+            }
+            _ => panic!("expected blob output for batch item {i}"),
+        }
+    }
+}
+
+// ── Test: run_batch with post-processing ─────────────────────────
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_run_batch_with_post_processing() {
+    let toml = r#"
+[model]
+name = "batch-post-test"
+file = "model.onnx"
+
+[post]
+steps = [
+    {op = "tensor.normalize"},
+]
+"#;
+    let pipeline = make_batch_pipeline(toml);
+
+    let inputs: Vec<(&[u8], &str)> = vec![
+        (b"input-0", "text/plain"),
+        (b"input-1", "text/plain"),
+        (b"input-2", "text/plain"),
+    ];
+
+    let results = pipeline.run_batch(&inputs).unwrap();
+    assert_eq!(results.len(), 3);
+
+    // Each output should be normalized (L2 norm ≈ 1.0).
+    for (i, result) in results.iter().enumerate() {
+        let output = result.as_ref().unwrap_or_else(|e| panic!("batch item {i} failed: {e}"));
+        match output {
+            KernelOutput::Json(v) => {
+                let data = v["data"].as_array().unwrap();
+                let l2: f64 = data
+                    .iter()
+                    .map(|v| {
+                        let x = v.as_f64().unwrap();
+                        x * x
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    (l2 - 1.0).abs() < 1e-3,
+                    "batch item {i}: L2 norm = {l2}"
+                );
+            }
+            KernelOutput::Blob { data, .. } => {
+                let floats: Vec<f32> = data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                let l2: f64 = floats.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                assert!(
+                    (l2 - 1.0).abs() < 1e-3,
+                    "batch item {i}: blob L2 norm = {l2}"
+                );
+            }
+        }
+    }
+}
+
+// ── Test: run_batch single item behaves like run() ───────────────
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_run_batch_single_item() {
+    let toml = r#"
+[model]
+name = "single-batch"
+file = "model.onnx"
+"#;
+    let pipeline = make_batch_pipeline(toml);
+
+    let single_result = pipeline.run(b"hello", "text/plain").unwrap();
+    let batch_results = pipeline.run_batch(&[(b"hello", "text/plain")]).unwrap();
+
+    assert_eq!(batch_results.len(), 1);
+    let batch_item = batch_results.into_iter().next().unwrap().unwrap();
+
+    // Both should produce blob outputs with same shape.
+    match (&single_result, &batch_item) {
+        (
+            KernelOutput::Blob {
+                shape: s1,
+                content_type: ct1,
+                ..
+            },
+            KernelOutput::Blob {
+                shape: s2,
+                content_type: ct2,
+                ..
+            },
+        ) => {
+            assert_eq!(s1, s2);
+            assert_eq!(ct1, ct2);
+        }
+        _ => {} // Different output types are acceptable for single vs batch
+    }
+}
+
+// ── Test: run_batch empty input ──────────────────────────────────
+
+#[test]
+fn test_run_batch_empty() {
+    let toml = r#"
+[model]
+name = "empty-batch"
+file = "model.onnx"
+"#;
+    let pipeline = make_batch_pipeline(toml);
+
+    let outputs = pipeline.run_batch(&[]).unwrap();
+    assert!(outputs.is_empty());
+}
+
+// ── Test: run_batch large batch size ─────────────────────────────
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_run_batch_large() {
+    let toml = r#"
+[model]
+name = "large-batch"
+file = "model.onnx"
+"#;
+    let pipeline = make_batch_pipeline(toml);
+
+    let input_data: Vec<Vec<u8>> = (0..32).map(|i| format!("input-{i}").into_bytes()).collect();
+    let inputs: Vec<(&[u8], &str)> = input_data
+        .iter()
+        .map(|d| (d.as_slice(), "text/plain"))
+        .collect();
+
+    let results = pipeline.run_batch(&inputs).unwrap();
+    assert_eq!(results.len(), 32);
+
+    // Verify each output is distinct (batch index tag).
+    for (i, result) in results.iter().enumerate() {
+        let output = result.as_ref().unwrap_or_else(|e| panic!("batch item {i} failed: {e}"));
+        if let KernelOutput::Blob { data, .. } = output {
+            let tag = f32::from_le_bytes(data[..4].try_into().unwrap());
+            assert_eq!(tag, i as f32, "batch item {i} mismatch");
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Audio pipeline integration tests
 // ══════════════════════════════════════════════════════════════════
 //

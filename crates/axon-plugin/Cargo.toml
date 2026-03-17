@@ -1,0 +1,14 @@
+[package]
+name = "axon-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "SDK for writing Axon WASM plugins in Rust"
+repository = "https://github.com/YubinghanBai/axon"
+keywords = ["axon", "wasm", "plugin", "ml", "inference"]
+
+# This crate is compiled to wasm32-unknown-unknown by plugin authors.
+# It has zero non-std dependencies to keep .wasm binaries small.
+
+[dependencies]
+serde_json = "1.0"

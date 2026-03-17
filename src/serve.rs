@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use axum::Router;
@@ -42,12 +43,12 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tracing::info_span;
 
-use crate::batch::{BatchConfig, BatchDispatcher};
-use crate::pipeline::Pipeline;
+use crate::batch::{BatchConfig, BatchDispatcher, Priority, BATCH_METRICS};
+use crate::pipeline::{InferenceMeta, Pipeline};
 
 // ── Metrics (lightweight Prometheus-compatible) ───────────────
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 /// Global inference metrics (lock-free atomics).
 #[derive(Default)]
@@ -111,13 +112,18 @@ static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(Metrics:
 /// Shared application state holding all loaded pipelines.
 #[derive(Clone)]
 pub struct AppState {
-    pub pipelines: Arc<HashMap<String, Arc<Pipeline>>>,
+    pub pipelines: Arc<parking_lot::RwLock<HashMap<String, Arc<Pipeline>>>>,
     /// Optional batch dispatchers (one per pipeline, when batching is enabled).
     pub batchers: Option<Arc<HashMap<String, Arc<BatchDispatcher>>>>,
     /// Versioned pipelines: name → {version → Pipeline}.
     /// Populated when `--pipeline name@version=path` syntax is used.
     pub versions: Arc<HashMap<String, HashMap<String, Arc<Pipeline>>>>,
+    /// Manifest paths for hot-reload: name → path.
+    pub manifest_paths: Arc<HashMap<String, String>>,
     pub started_at: Instant,
+    /// Readiness flag: false during warmup, true when ready to serve.
+    /// Set to false again during graceful shutdown.
+    pub ready: Arc<AtomicBool>,
 }
 
 // ── Error type ─────────────────────────────────────────────────
@@ -228,10 +234,9 @@ pub fn build_router(config: &ServeConfig) -> Result<(Router, AppState), ServeErr
         pipelines.insert(base_name, pipeline);
     }
 
-    let pipelines = Arc::new(pipelines);
     let versions = Arc::new(versions);
 
-    // Build batch dispatchers if batching is enabled.
+    // Build batch dispatchers if batching is enabled (before wrapping in RwLock).
     let batchers = config.batch.as_ref().map(|batch_config| {
         let mut dispatchers = HashMap::new();
         for (name, pipeline) in pipelines.iter() {
@@ -245,17 +250,34 @@ pub fn build_router(config: &ServeConfig) -> Result<(Router, AppState), ServeErr
         Arc::new(dispatchers)
     });
 
+    // Build manifest path map for hot-reload.
+    let manifest_paths: HashMap<String, String> = config
+        .pipelines
+        .iter()
+        .map(|(raw_name, path)| {
+            let base = raw_name.split_once('@').map_or(raw_name.as_str(), |(n, _)| n);
+            (base.to_string(), path.clone())
+        })
+        .collect();
+
+    let pipelines = Arc::new(parking_lot::RwLock::new(pipelines));
+
     let state = AppState {
         pipelines,
         batchers,
         versions,
+        manifest_paths: Arc::new(manifest_paths),
         started_at: Instant::now(),
+        ready: Arc::new(AtomicBool::new(false)),
     };
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/health/live", get(liveness_handler))
+        .route("/health/ready", get(readiness_handler))
         .route("/metrics", get(metrics_handler))
         .route("/pipelines", get(pipelines_handler))
+        .route("/admin/reload/{name}", post(reload_handler))
         .route("/{name}", post(inference_handler))
         .route("/{name}/stream", post(stream_handler))
         .route("/{name}/info", get(info_handler))
@@ -268,16 +290,38 @@ pub fn build_router(config: &ServeConfig) -> Result<(Router, AppState), ServeErr
 }
 
 /// Start the server (blocking on the async runtime).
+///
+/// Lifecycle:
+/// 1. Load pipelines + build router
+/// 2. Warmup: run dummy inference on each pipeline (ONNX session load + JIT)
+/// 3. Set ready=true, bind port, start serving
+/// 4. On SIGTERM/SIGINT: set ready=false, drain in-flight, exit
 pub async fn run_server(config: ServeConfig) -> Result<(), ServeError> {
     let (app, state) = build_router(&config)?;
+
+    let pipelines_guard = state.pipelines.read();
+    let pipeline_count = pipelines_guard.len();
+    let names: Vec<String> = pipelines_guard.keys().cloned().collect();
+
+    // Warmup: pre-load ONNX sessions + trigger JIT compilation.
+    eprintln!("warming up {} pipeline(s)...", pipeline_count);
+    for (name, pipeline) in pipelines_guard.iter() {
+        let start = Instant::now();
+        pipeline.warmup();
+        let elapsed = start.elapsed();
+        eprintln!("  {} warmed up in {:.1}ms", name, elapsed.as_secs_f64() * 1000.0);
+    }
+    drop(pipelines_guard);
+
+    // Mark as ready after warmup.
+    state.ready.store(true, Ordering::Release);
+    tracing::info!("warmup complete, server ready");
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| ServeError::Bind(format!("{addr}: {e}")))?;
 
-    let pipeline_count = state.pipelines.len();
-    let names: Vec<&str> = state.pipelines.keys().map(|s| s.as_str()).collect();
     tracing::info!(
         addr = %addr,
         pipelines = pipeline_count,
@@ -285,9 +329,10 @@ pub async fn run_server(config: ServeConfig) -> Result<(), ServeError> {
         "axon serve started"
     );
 
-    // Print human-readable startup message.
+    let names_ref: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+
     eprintln!("axon serve listening on {addr}");
-    eprintln!("pipelines: {}", names.join(", "));
+    eprintln!("pipelines: {}", names_ref.join(", "));
     if state.batchers.is_some() {
         eprintln!("batching: enabled");
     }
@@ -296,29 +341,94 @@ pub async fn run_server(config: ServeConfig) -> Result<(), ServeError> {
     }
     eprintln!();
 
+    // Graceful shutdown: wait for SIGTERM/SIGINT, then drain in-flight requests.
+    let ready_flag = state.ready.clone();
+    let shutdown_signal = async move {
+        shutdown_signal().await;
+        // Mark as not-ready so K8s stops routing traffic.
+        ready_flag.store(false, Ordering::Release);
+        eprintln!("\nshutting down gracefully (draining in-flight requests)...");
+        tracing::info!("shutdown signal received, draining");
+    };
+
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
         .await
-        .map_err(|e| ServeError::Bind(e.to_string()))
+        .map_err(|e| ServeError::Bind(e.to_string()))?;
+
+    eprintln!("server stopped");
+    Ok(())
+}
+
+/// Wait for SIGTERM (K8s pod termination) or SIGINT (Ctrl+C).
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
 }
 
 // ── Handlers ───────────────────────────────────────────────────
 
-/// GET /health — server health check.
+/// GET /health — server health check (backward-compatible).
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let names: Vec<&str> = state.pipelines.keys().map(|s| s.as_str()).collect();
+    let names: Vec<String> = state.pipelines.read().keys().cloned().collect();
+    let is_ready = state.ready.load(Ordering::Acquire);
     Json(json!({
-        "status": "ok",
+        "status": if is_ready { "ok" } else { "warming_up" },
+        "ready": is_ready,
         "uptime_seconds": uptime_secs,
         "pipelines": names,
         "batching": state.batchers.is_some(),
     }))
 }
 
+/// GET /health/live — Kubernetes liveness probe.
+///
+/// Returns 200 if the process is alive and responding.
+/// If this fails, K8s should restart the pod.
+async fn liveness_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+/// GET /health/ready — Kubernetes readiness probe.
+///
+/// Returns 200 when models are warmed up and the server can handle traffic.
+/// Returns 503 during warmup and during graceful shutdown draining.
+async fn readiness_handler(State(state): State<AppState>) -> Response {
+    if state.ready.load(Ordering::Acquire) {
+        (StatusCode::OK, Json(json!({"ready": true}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ready": false, "reason": "warming up or shutting down"})),
+        )
+            .into_response()
+    }
+}
+
 /// GET /metrics — Prometheus-compatible metrics endpoint.
 async fn metrics_handler(State(state): State<AppState>) -> Response {
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let body = METRICS.to_prometheus(uptime_secs);
+    let mut body = METRICS.to_prometheus(uptime_secs);
+    // Append batch metrics if batching is enabled.
+    if state.batchers.is_some() {
+        body.push_str(&BATCH_METRICS.to_prometheus());
+    }
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -330,7 +440,7 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
 /// GET /pipelines — list all loaded pipelines with metadata.
 async fn pipelines_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut entries = Vec::new();
-    for (name, pipeline) in state.pipelines.iter() {
+    for (name, pipeline) in state.pipelines.read().iter() {
         let manifest = pipeline.manifest();
         entries.push(json!({
             "name": name,
@@ -348,7 +458,7 @@ async fn info_handler(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let Some(pipeline) = state.pipelines.get(&name) else {
+    let Some(pipeline) = state.pipelines.read().get(&name).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("pipeline '{name}' not found") })),
@@ -393,7 +503,7 @@ async fn inference_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(pipeline) = state.pipelines.get(&name) else {
+    let Some(pipeline) = state.pipelines.read().get(&name).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("pipeline '{name}' not found") })),
@@ -407,14 +517,39 @@ async fn inference_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
+    // Extract session ID for stateful pipelines.
+    let session_id = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Handle multipart: extract the "input" field.
     if content_type.starts_with("multipart/form-data") {
         let batcher = state
             .batchers
             .as_ref()
             .and_then(|b| b.get(&name).cloned());
-        return handle_multipart(pipeline.clone(), batcher, headers, body).await;
+        return handle_multipart(pipeline.clone(), batcher, session_id, headers, body).await;
     }
+
+    // Extract priority for batch scheduling.
+    let priority = headers
+        .get("x-priority")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            if s.eq_ignore_ascii_case("high") {
+                Priority::High
+            } else {
+                Priority::Low
+            }
+        })
+        .unwrap_or(Priority::Low);
+
+    // Extract request deadline from X-Timeout-Ms header.
+    let deadline = headers
+        .get("x-timeout-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::deadline::parse_deadline_header);
 
     // Raw body inference.
     let input_bytes = body.to_vec();
@@ -432,18 +567,19 @@ async fn inference_handler(
     // Route through batch dispatcher if batching is enabled.
     if let Some(ref batchers) = state.batchers {
         if let Some(batcher) = batchers.get(&name) {
-            return run_pipeline_batched(batcher, input_bytes, content_type.to_string(), body_size).await;
+            return run_pipeline_batched(batcher, input_bytes, content_type.to_string(), body_size, priority).await;
         }
     }
 
     // Direct execution (no batching).
-    run_pipeline(pipeline.clone(), input_bytes, content_type.to_string(), pipeline_name, body_size).await
+    run_pipeline(pipeline.clone(), input_bytes, content_type.to_string(), pipeline_name, body_size, session_id, deadline).await
 }
 
 /// Handle multipart form upload — extract the "input" field.
 async fn handle_multipart(
     pipeline: Arc<Pipeline>,
     batcher: Option<Arc<BatchDispatcher>>,
+    session_id: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -509,9 +645,9 @@ async fn handle_multipart(
 
         let body_size = data.len();
         if let Some(ref batcher) = batcher {
-            return run_pipeline_batched(batcher, data, file_content_type, body_size).await;
+            return run_pipeline_batched(batcher, data, file_content_type, body_size, Priority::Low).await;
         }
-        return run_pipeline(pipeline, data, file_content_type, "multipart".to_string(), body_size).await;
+        return run_pipeline(pipeline, data, file_content_type, "multipart".to_string(), body_size, session_id, None).await;
     }
 
     (
@@ -551,7 +687,7 @@ async fn stream_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(pipeline) = state.pipelines.get(&name).cloned() else {
+    let Some(pipeline) = state.pipelines.read().get(&name).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("pipeline '{name}' not found") })),
@@ -701,7 +837,11 @@ async fn versioned_inference_handler(
     let body_size = input_bytes.len();
     let pipeline_name = format!("{name}@{version}");
 
-    run_pipeline(pipeline, input_bytes, content_type.to_string(), pipeline_name, body_size).await
+    let session_id = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    run_pipeline(pipeline, input_bytes, content_type.to_string(), pipeline_name, body_size, session_id, None).await
 }
 
 /// GET /{name}/versions — list available versions for a pipeline.
@@ -725,6 +865,88 @@ async fn versions_handler(
     .into_response()
 }
 
+/// POST /admin/reload/{name} — hot-reload a pipeline from its manifest.
+///
+/// Zero-downtime model update:
+/// 1. Parse the manifest and create a new Pipeline.
+/// 2. Warmup (load ONNX session + dummy inference).
+/// 3. Atomically swap the old pipeline for the new one.
+///
+/// Returns 200 on success, 404 if pipeline not found, 500 on load failure.
+async fn reload_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    // Check pipeline exists.
+    if !state.pipelines.read().contains_key(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("pipeline '{name}' not found") })),
+        )
+            .into_response();
+    }
+
+    let Some(manifest_path) = state.manifest_paths.get(&name).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no manifest path for pipeline '{name}'") })),
+        )
+            .into_response();
+    };
+
+    // Load + warmup on a blocking thread.
+    let result = tokio::task::spawn_blocking(move || {
+        let pipeline = Pipeline::load(&manifest_path)
+            .map_err(|e| format!("load failed: {e}"))?;
+        if let Err(missing) = pipeline.validate() {
+            return Err(format!("missing kernels: {}", missing.join(", ")));
+        }
+        pipeline.warmup();
+        Ok(Arc::new(pipeline))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(new_pipeline)) => {
+            let model_name = new_pipeline.manifest().model.name.clone();
+            state.pipelines.write().insert(name.clone(), new_pipeline);
+            tracing::info!(pipeline = %name, model = %model_name, "pipeline hot-reloaded");
+            Json(json!({
+                "status": "ok",
+                "pipeline": name,
+                "model": model_name,
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("reload task panicked: {join_err}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Build response headers from InferenceMeta.
+fn meta_headers(meta: &InferenceMeta) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = meta.total_us.to_string().parse() {
+        headers.insert("x-axon-compute-us", v);
+    }
+    if let Ok(v) = meta.cache_hit.to_string().parse() {
+        headers.insert("x-axon-cache-hit", v);
+    }
+    headers.insert(
+        "x-axon-device",
+        meta.device.parse().unwrap_or_else(|_| "cpu".parse().unwrap()),
+    );
+    headers
+}
+
 /// Run the pipeline on a blocking thread and return the response.
 async fn run_pipeline(
     pipeline: Arc<Pipeline>,
@@ -732,12 +954,12 @@ async fn run_pipeline(
     content_type: String,
     pipeline_name: String,
     body_size: usize,
+    session_id: Option<String>,
+    deadline: Option<crate::deadline::RequestBudget>,
 ) -> Response {
     let start = Instant::now();
 
     // Pipeline::run is synchronous — run on blocking thread pool.
-    // The span is created and entered on the blocking thread (sync context),
-    // so the Entered guard is safe (no Send requirement).
     let result = tokio::task::spawn_blocking(move || {
         let _span = info_span!(
             "axon_request",
@@ -746,7 +968,7 @@ async fn run_pipeline(
             content_type = %content_type,
         )
         .entered();
-        pipeline.run(&input, &content_type)
+        pipeline.run_with_session(&input, &content_type, session_id.as_deref(), deadline.as_ref())
     })
     .await;
 
@@ -754,22 +976,25 @@ async fn run_pipeline(
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
     match result {
-        Ok(Ok(output)) => {
+        Ok(Ok((output, meta))) => {
             METRICS.record_ok(elapsed);
+            let extra_headers = meta_headers(&meta);
             match output {
                 crate::KernelOutput::Json(value) => {
                     let resp = json!({
                         "result": value,
                         "latency_ms": format!("{elapsed_ms:.1}"),
                     });
-                    Json(resp).into_response()
+                    let mut response = Json(resp).into_response();
+                    response.headers_mut().extend(extra_headers);
+                    response
                 }
                 crate::KernelOutput::Blob {
                     data,
                     content_type,
                     shape,
                 } => {
-                    let mut headers = HeaderMap::new();
+                    let mut headers = extra_headers;
                     headers.insert(
                         "content-type",
                         content_type.parse().unwrap_or_else(|_| {
@@ -792,14 +1017,35 @@ async fn run_pipeline(
         }
         Ok(Err(pipeline_err)) => {
             METRICS.record_err();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
+            let status = match &pipeline_err {
+                crate::pipeline::PipelineError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
+                crate::pipeline::PipelineError::GuardFailed(_) => StatusCode::BAD_REQUEST,
+                crate::pipeline::PipelineError::DeadlineExceeded(_) => StatusCode::REQUEST_TIMEOUT,
+                crate::pipeline::PipelineError::HealthCheckFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let body = match &pipeline_err {
+                crate::pipeline::PipelineError::GuardFailed(guard_err) => json!({
+                    "error": "input_validation_failed",
+                    "rule": guard_err.rule,
+                    "message": guard_err.message,
+                }),
+                crate::pipeline::PipelineError::DeadlineExceeded(de) => json!({
+                    "error": "deadline_exceeded",
+                    "phase": de.phase,
+                    "message": de.to_string(),
+                }),
+                crate::pipeline::PipelineError::HealthCheckFailed(alert) => json!({
+                    "error": "output_health_check_failed",
+                    "rule": alert.rule,
+                    "message": alert.message,
+                }),
+                _ => json!({
                     "error": pipeline_err.to_string(),
                     "latency_ms": format!("{elapsed_ms:.1}"),
-                })),
-            )
-                .into_response()
+                }),
+            };
+            (status, Json(body)).into_response()
         }
         Err(join_err) => {
             METRICS.record_err();
@@ -820,16 +1066,18 @@ async fn run_pipeline_batched(
     input: Vec<u8>,
     content_type: String,
     _body_size: usize,
+    priority: Priority,
 ) -> Response {
     let start = Instant::now();
 
-    let result = batcher.submit(input, content_type).await;
+    let result = batcher.submit(input, content_type, priority).await;
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
     match result {
-        Ok(output) => {
+        Ok((output, meta)) => {
             METRICS.record_ok(elapsed);
+            let extra_headers = meta_headers(&meta);
             match output {
             crate::KernelOutput::Json(value) => {
                 let resp = json!({
@@ -837,14 +1085,16 @@ async fn run_pipeline_batched(
                     "latency_ms": format!("{elapsed_ms:.1}"),
                     "batched": true,
                 });
-                Json(resp).into_response()
+                let mut response = Json(resp).into_response();
+                response.headers_mut().extend(extra_headers);
+                response
             }
             crate::KernelOutput::Blob {
                 data,
                 content_type,
                 shape,
             } => {
-                let mut headers = HeaderMap::new();
+                let mut headers = extra_headers;
                 headers.insert(
                     "content-type",
                     content_type.parse().unwrap_or_else(|_| {
@@ -868,8 +1118,13 @@ async fn run_pipeline_batched(
         }
         Err(pipeline_err) => {
             METRICS.record_err();
+            let status = match &pipeline_err {
+                crate::pipeline::PipelineError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
+                crate::pipeline::PipelineError::GuardFailed(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 Json(json!({
                     "error": pipeline_err.to_string(),
                     "latency_ms": format!("{elapsed_ms:.1}"),
@@ -943,14 +1198,18 @@ file = "model.onnx"
         versions.insert("test".to_string(), ver_map);
 
         let state = AppState {
-            pipelines: Arc::new(pipelines),
+            pipelines: Arc::new(parking_lot::RwLock::new(pipelines)),
             batchers: None,
             versions: Arc::new(versions),
+            manifest_paths: Arc::new(HashMap::new()),
             started_at: Instant::now(),
+            ready: Arc::new(AtomicBool::new(true)),
         };
 
         Router::new()
             .route("/health", get(health_handler))
+            .route("/health/live", get(liveness_handler))
+            .route("/health/ready", get(readiness_handler))
             .route("/metrics", get(metrics_handler))
             .route("/pipelines", get(pipelines_handler))
             .route("/{name}", post(inference_handler))
@@ -1212,11 +1471,13 @@ file = "model.onnx"
 
         let mut pipelines = HashMap::new();
         pipelines.insert("test".to_string(), pipeline.clone());
-        let pipelines = Arc::new(pipelines);
 
         let batch_config = BatchConfig {
             max_batch_size: 4,
             timeout: std::time::Duration::from_millis(50),
+            adaptive: false,
+            min_batch_size: 1,
+            queue_capacity: 0,
         };
 
         let mut dispatchers = HashMap::new();
@@ -1226,14 +1487,18 @@ file = "model.onnx"
         );
 
         let state = AppState {
-            pipelines,
+            pipelines: Arc::new(parking_lot::RwLock::new(pipelines)),
             batchers: Some(Arc::new(dispatchers)),
             versions: Arc::new(HashMap::new()),
+            manifest_paths: Arc::new(HashMap::new()),
             started_at: Instant::now(),
+            ready: Arc::new(AtomicBool::new(true)),
         };
 
         Router::new()
             .route("/health", get(health_handler))
+            .route("/health/live", get(liveness_handler))
+            .route("/health/ready", get(readiness_handler))
             .route("/pipelines", get(pipelines_handler))
             .route("/{name}", post(inference_handler))
             .route("/{name}/info", get(info_handler))
@@ -1437,5 +1702,81 @@ file = "model.onnx"
             guess_content_type_from_ext("data.bin"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn test_liveness_probe() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/live")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readiness_probe_ready() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["ready"], true);
+    }
+
+    #[tokio::test]
+    async fn test_readiness_probe_not_ready() {
+        // Build an app with ready=false (simulates warmup phase).
+        let manifest = crate::Manifest::from_toml(
+            r#"
+[model]
+name = "test-model"
+file = "model.onnx"
+"#,
+        )
+        .unwrap();
+        let mut reg = crate::KernelRegistry::new();
+        reg.register(Arc::new(MockOnnxKernel));
+        let pipeline = Arc::new(Pipeline::new(manifest, reg, std::path::PathBuf::from(".")));
+        let mut pipelines = HashMap::new();
+        pipelines.insert("test".to_string(), pipeline);
+
+        let state = AppState {
+            pipelines: Arc::new(parking_lot::RwLock::new(pipelines)),
+            batchers: None,
+            versions: Arc::new(HashMap::new()),
+            manifest_paths: Arc::new(HashMap::new()),
+            started_at: Instant::now(),
+            ready: Arc::new(AtomicBool::new(false)), // NOT ready
+        };
+
+        let app = Router::new()
+            .route("/health/ready", get(readiness_handler))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["ready"], false);
     }
 }

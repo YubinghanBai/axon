@@ -22,13 +22,21 @@
 //! let output = kernel.execute(KernelInput::from_json(input), ops)?;
 //! ```
 
+pub mod audit;
 pub mod blob;
+pub mod canary;
+pub mod coalesce;
+pub mod context;
+pub mod deadline;
 pub mod error;
+pub mod guard;
+pub mod healthcheck;
 pub mod kernel;
 pub mod kernels;
 pub mod manifest;
 pub mod pipeline;
 pub mod pool;
+pub mod shadow;
 #[cfg(feature = "serve")]
 pub mod batch;
 #[cfg(feature = "serve")]
@@ -42,6 +50,7 @@ pub mod otel;
 
 pub use blob::{BlobId, BlobMeta, BlobRef, BlobStore};
 pub use error::AxonError;
+pub use healthcheck::{HealthAlert, OutputHealthCheck};
 pub use kernel::{BlobData, ComputeKernel, KernelInput, KernelOutput, KernelRegistry};
 pub use manifest::Manifest;
 pub use pipeline::{Pipeline, PipelineError};

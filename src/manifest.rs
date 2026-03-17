@@ -43,6 +43,133 @@ pub struct Manifest {
     /// Post-processing steps (run after model inference).
     #[serde(default)]
     pub post: Option<StepsConfig>,
+
+    /// Cascade inference: run a fast model first, fall back to a heavier
+    /// model only when confidence is below threshold.
+    #[serde(default)]
+    pub cascade: Option<CascadeConfig>,
+
+    /// Inference result caching (content-addressable, skip model on cache hit).
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+
+    /// Resilience / circuit breaker: automatic device fallback on failures.
+    #[serde(default)]
+    pub resilience: Option<ResilienceConfig>,
+
+    /// Input guard: pre-processing validation rules.
+    #[serde(default)]
+    pub guard: Option<GuardConfig>,
+
+    /// Audit trail: append-only JSONL logging of inference requests.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+
+    /// Shadow inference: A/B comparison with a shadow model.
+    #[serde(default)]
+    pub shadow: Option<ShadowConfig>,
+
+    /// Canary traffic routing for safe model rollouts.
+    #[serde(default)]
+    pub canary: Option<CanaryConfig>,
+
+    /// Output health check: NaN/Inf/range validation on kernel outputs.
+    #[serde(default)]
+    pub healthcheck: Option<HealthCheckConfig>,
+}
+
+/// Cascade inference configuration.
+///
+/// Two modes: fixed threshold or adaptive.
+///
+/// Fixed threshold:
+/// ```toml
+/// [cascade]
+/// confidence_threshold = 0.95
+/// fallback = "resnet50.onnx"
+/// ```
+///
+/// Adaptive threshold (adjusts to maintain target fallback rate):
+/// ```toml
+/// [cascade]
+/// confidence_threshold = 0.95
+/// fallback = "resnet50.onnx"
+/// target_fallback_rate = 0.15
+/// adjust_interval = 100
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct CascadeConfig {
+    /// Minimum confidence score to accept the primary model's output.
+    /// If the max output score is below this, the fallback model is used.
+    /// When adaptive mode is enabled, this is the initial threshold.
+    pub confidence_threshold: f64,
+    /// Path to the fallback model file (relative to manifest dir).
+    pub fallback: String,
+    /// Device for fallback model (defaults to primary model's device).
+    #[serde(default)]
+    pub fallback_device: Option<String>,
+    /// Target fallback rate (0.0–1.0). Enables adaptive threshold mode.
+    /// The threshold auto-adjusts to maintain this cascade trigger rate.
+    #[serde(default)]
+    pub target_fallback_rate: Option<f64>,
+    /// How often to adjust the threshold (every N requests). Default: 100.
+    #[serde(default = "default_adjust_interval")]
+    pub adjust_interval: u64,
+}
+
+fn default_adjust_interval() -> u64 {
+    100
+}
+
+/// Inference cache configuration.
+///
+/// ```toml
+/// [cache]
+/// ttl_seconds = 3600
+/// max_entries = 10000
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheConfig {
+    /// Time-to-live for cached results in seconds.
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_seconds: u64,
+    /// Maximum number of cached entries.
+    #[serde(default = "default_cache_max")]
+    pub max_entries: u64,
+}
+
+fn default_cache_ttl() -> u64 {
+    3600
+}
+fn default_cache_max() -> u64 {
+    10000
+}
+
+/// Resilience / circuit breaker configuration.
+///
+/// ```toml
+/// [resilience]
+/// fallback_device = "cpu"
+/// failure_threshold = 3
+/// recovery_timeout_seconds = 60
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResilienceConfig {
+    /// Device to fall back to when the primary device fails repeatedly.
+    pub fallback_device: String,
+    /// Number of consecutive failures before opening the circuit.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Seconds before attempting recovery on the primary device.
+    #[serde(default = "default_recovery_timeout")]
+    pub recovery_timeout_seconds: u64,
+}
+
+fn default_failure_threshold() -> u32 {
+    3
+}
+fn default_recovery_timeout() -> u64 {
+    60
 }
 
 /// Model metadata and file path.
@@ -106,6 +233,112 @@ pub struct StepConfig {
     /// All other fields become operation parameters.
     #[serde(flatten)]
     pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Input guard configuration.
+///
+/// ```toml
+/// [guard]
+/// max_size = "10MB"
+/// allowed_content_types = ["image/jpeg", "image/png"]
+/// required_json_fields = ["image", "model_id"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GuardConfig {
+    /// Maximum input size (e.g. "10MB", "1GB", "1024").
+    #[serde(default)]
+    pub max_size: Option<String>,
+    /// Allowed MIME content types.
+    #[serde(default)]
+    pub allowed_content_types: Option<Vec<String>>,
+    /// Required JSON fields (checked only for JSON/text content types).
+    #[serde(default)]
+    pub required_json_fields: Option<Vec<String>>,
+}
+
+/// Audit trail configuration.
+///
+/// ```toml
+/// [audit]
+/// path = "/var/log/axon/inference.jsonl"
+/// sample_rate = 1.0
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditConfig {
+    /// Path to the JSONL audit log file.
+    pub path: String,
+    /// Sample rate: 0.0–1.0 (default 1.0, log everything).
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+}
+
+fn default_sample_rate() -> f64 {
+    1.0
+}
+
+/// Shadow inference configuration.
+///
+/// ```toml
+/// [shadow]
+/// model = "models/v2/model.onnx"
+/// sample_rate = 0.1
+/// log_path = "/var/log/axon/shadow.jsonl"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShadowConfig {
+    /// Path to the shadow model file (relative to manifest directory).
+    pub model: String,
+    /// Shadow model device (defaults to primary model's device).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Sample rate: 0.0–1.0 (default 0.1).
+    #[serde(default = "default_shadow_sample_rate")]
+    pub sample_rate: f64,
+    /// Path to the comparison JSONL log file.
+    pub log_path: String,
+}
+
+fn default_shadow_sample_rate() -> f64 {
+    0.1
+}
+
+/// Canary traffic routing configuration.
+///
+/// ```toml
+/// [canary]
+/// model = "models/v2/model.onnx"
+/// weight = 5
+/// sticky_sessions = true
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct CanaryConfig {
+    /// Path to the canary model file (relative to manifest directory).
+    pub model: String,
+    /// Percentage of traffic routed to canary (0-100).
+    pub weight: u8,
+    /// Canary model device (defaults to primary model's device).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// If true, same session always sees same model version (deterministic routing).
+    #[serde(default)]
+    pub sticky_sessions: Option<bool>,
+}
+
+/// Output health check configuration.
+///
+/// ```toml
+/// [healthcheck]
+/// nan_check = true
+/// output_range = [0.0, 1.0]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Whether to check for NaN and Infinity values in outputs.
+    #[serde(default)]
+    pub nan_check: Option<bool>,
+    /// Optional [min, max] bounds for numeric output values.
+    #[serde(default)]
+    pub output_range: Option<[f64; 2]>,
 }
 
 impl Manifest {
